@@ -4,7 +4,7 @@
 # https://www.getpagespeed.com/server-setup/clear-disk-space-centos
 #
 # To use, simple run the following command
-# curl -Ls https://github.com/jgiambona/linux-scripts/clean-centos-disk-space | sudo bash
+# curl -Ls https://raw.githubusercontent.com/jgiambona/linux-scripts/master/clean-centos-disk-space | sudo bash
 #
 
 if rpm -q yum-utils > /dev/null; then
