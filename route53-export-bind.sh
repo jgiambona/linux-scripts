@@ -7,6 +7,10 @@ usage() {
   exit 1
 }
 
+read -rp "AWS CLI profile (press Enter for none): " _profile
+_profile_args=()
+[[ -n "$_profile" ]] && _profile_args=(--profile "$_profile")
+
 while [[ $1 ]]; do
   if   [[ $1 == --id ]];     then shift; zone_id="$1"
   elif [[ $1 == --domain ]]; then shift; zone_name="$1"
@@ -17,7 +21,7 @@ done
 
 if [[ $zone_name ]]; then
   zone_id=$(
-    aws route53 list-hosted-zones --profile ndc --output json \
+    aws route53 list-hosted-zones "${_profile_args[@]}" --output json \
       | jq -r ".HostedZones[] | select(.Name == \"$zone_name.\") | .Id" \
       | head -n1 \
       | cut -d/ -f3
@@ -26,5 +30,5 @@ if [[ $zone_name ]]; then
 fi
 [[ $zone_id ]] || usage
 
-aws route53 list-resource-record-sets --profile ndc --hosted-zone-id $zone_id --output json \
+aws route53 list-resource-record-sets "${_profile_args[@]}" --hosted-zone-id $zone_id --output json \
   | jq -jr '.ResourceRecordSets[] | "\(.Name) \t\(.TTL) \t\(.Type) \t\(.ResourceRecords[]?.Value)\n"'

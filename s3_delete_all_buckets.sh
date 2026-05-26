@@ -1,7 +1,10 @@
 #!/bin/bash
 
-PROFILE="jazzypay"  # Replace with your AWS CLI profile
-BUCKETS=$(aws s3api list-buckets --query "Buckets[].Name" --output text --profile "$PROFILE")
+read -rp "AWS CLI profile (press Enter for none): " PROFILE
+PROFILE_ARGS=()
+[[ -n "$PROFILE" ]] && PROFILE_ARGS=(--profile "$PROFILE")
+
+BUCKETS=$(aws s3api list-buckets --query "Buckets[].Name" --output text "${PROFILE_ARGS[@]}")
 
 # Colors for output
 RED='\033[1;31m'
@@ -41,7 +44,7 @@ delete_objects_batch() {
   local objects_json=$2
   local count=$(echo "$objects_json" | jq '.Objects | length')
   if (( count > 0 )); then
-    run_aws aws s3api delete-objects --bucket "$bucket" --delete "$objects_json" --profile "$PROFILE"
+    run_aws aws s3api delete-objects --bucket "$bucket" --delete "$objects_json" "${PROFILE_ARGS[@]}"
     echo "$count"
   else
     echo 0
@@ -60,9 +63,9 @@ process_bucket() {
   while :; do
     # Get one page of versions and markers
     if [[ -z "$key_marker" ]]; then
-      resp=$(aws s3api list-object-versions --bucket "$bucket" --profile "$PROFILE" --output json)
+      resp=$(aws s3api list-object-versions --bucket "$bucket" "${PROFILE_ARGS[@]}" --output json)
     else
-      resp=$(aws s3api list-object-versions --bucket "$bucket" --profile "$PROFILE" --output json --key-marker "$key_marker" --version-id-marker "$version_id_marker")
+      resp=$(aws s3api list-object-versions --bucket "$bucket" "${PROFILE_ARGS[@]}" --output json --key-marker "$key_marker" --version-id-marker "$version_id_marker")
     fi
 
     # Extract versions and delete markers into delete request JSON formats
@@ -90,7 +93,7 @@ process_bucket() {
 
   # After all objects deleted, delete the bucket
   echo "Deleting bucket: $bucket"
-  run_aws aws s3 rb s3://"$bucket" --force --profile "$PROFILE"
+  run_aws aws s3 rb s3://"$bucket" --force "${PROFILE_ARGS[@]}"
   echo -e "${GREEN}Bucket $bucket deleted.${RESET}"
 }
 
