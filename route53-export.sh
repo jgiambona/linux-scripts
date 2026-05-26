@@ -148,7 +148,7 @@ generate_output() {
       echo "Name,Type,TTL,Value"
       echo "$records" | jq -r '
         .ResourceRecordSets[] |
-        ($.Name | rtrimstr(".")) as $name |
+        (.Name | rtrimstr(".")) as $name |
         (.Type) as $type |
         (.TTL // 300) as $ttl |
         .ResourceRecords[]?.Value as $val |
@@ -159,7 +159,7 @@ generate_output() {
     powerdns)
       echo "$records" | jq -r '
         .ResourceRecordSets[] |
-        ($.Name | rtrimstr(".")) as $name |
+        (.Name | rtrimstr(".")) as $name |
         (.Type) as $type |
         (.TTL // 300) as $ttl |
         .ResourceRecords[]?.Value as $val |
