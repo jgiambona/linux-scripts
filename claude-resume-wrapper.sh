@@ -1,5 +1,27 @@
 #!/usr/bin/env bash
-# Resume a Claude Code session after a usage-limit reset.
+# claude-resume-wrapper.sh
+#
+# Interactive Claude Code launcher that waits and resumes after a usage limit.
+# A normal invocation starts a fresh session with a generated UUID, allowing the
+# wrapper to resume that exact session instead of whichever session is newest.
+# Use --continue or --resume explicitly when starting from an existing session.
+# Other interactive Claude options and an optional prompt pass through on the
+# initial launch.
+#
+# Usage:
+#   claude-smart [CLAUDE_OPTIONS] [PROMPT]
+#   claude-smart --name billing-fix --model opus
+#   claude-smart --worktree billing-fix --model sonnet
+#   claude-smart --continue
+#   claude-smart --resume SESSION_ID
+#
+# Configuration:
+#   CLAUDE_SMART_RETRY_SECONDS  Seconds between retries (default: 900)
+#   CLAUDE_SMART_MAX_RETRIES    Maximum retries; 0 means unlimited (default: 24)
+#
+# The wrapper is for interactive, persistent local sessions. It rejects print,
+# background, cloud, remote-control, non-persistent, and forked session modes.
+# Claude must exit after showing a limit before the wrapper can begin waiting.
 
 set -u
 
