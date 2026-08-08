@@ -8,8 +8,11 @@ A collection of standalone Linux and AWS administration scripts.
 
 ### `claude-resume-wrapper.sh` — Claude Code usage-limit retry wrapper
 
-Continues the most recent Claude Code session in the current directory and
-retries after Claude reports a usage limit and exits. It preserves Claude's
+Starts a fresh, explicitly identified Claude Code session by default. If Claude
+reports a usage limit and exits, the wrapper retries that exact session rather
+than whichever session happens to be newest. Interactive Claude options pass
+through on the initial launch, and `--continue` or `--resume` can be used when
+you intentionally want an existing session. The wrapper preserves Claude's
 interactive terminal UI and stops on unrelated errors. By default it retries
 every 15 minutes, up to 24 times. If Claude remains open at its prompt after
 showing the limit, exit Claude normally to start the wait-and-retry cycle.
@@ -20,12 +23,24 @@ showing the limit, exit Claude normally to start the wait-and-retry cycle.
 chmod +x claude-resume-wrapper.sh
 sudo install -m 0755 claude-resume-wrapper.sh /usr/local/bin/claude-smart
 
-# Run from the project whose most recent Claude session should be continued.
+# Start a fresh session.
 claude-smart
+
+# Start fresh with normal Claude options.
+claude-smart --name billing-fix --model opus
+claude-smart --worktree billing-fix --model sonnet
+
+# Deliberately continue or resume an existing session.
+claude-smart --continue
+claude-smart --resume SESSION_ID
 
 # Optional: retry every 30 minutes with no retry limit.
 CLAUDE_SMART_RETRY_SECONDS=1800 CLAUDE_SMART_MAX_RETRIES=0 claude-smart
 ```
+
+Non-interactive (`--print`), background, cloud, remote-control, non-persistent,
+and forked sessions are rejected because their lifecycle conflicts with this
+interactive auto-resume wrapper.
 
 ---
 
