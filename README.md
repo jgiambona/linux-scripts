@@ -4,6 +4,31 @@ A collection of standalone Linux and AWS administration scripts.
 
 ---
 
+## Developer tools
+
+### `claude-resume-wrapper.sh` — Claude Code usage-limit retry wrapper
+
+Continues the most recent Claude Code session in the current directory and
+retries after Claude reports a usage limit and exits. It preserves Claude's
+interactive terminal UI and stops on unrelated errors. By default it retries
+every 15 minutes, up to 24 times. If Claude remains open at its prompt after
+showing the limit, exit Claude normally to start the wait-and-retry cycle.
+
+**Dependencies:** Claude Code, Bash, and the standard `script` utility
+
+```bash
+chmod +x claude-resume-wrapper.sh
+sudo install -m 0755 claude-resume-wrapper.sh /usr/local/bin/claude-smart
+
+# Run from the project whose most recent Claude session should be continued.
+claude-smart
+
+# Optional: retry every 30 minutes with no retry limit.
+CLAUDE_SMART_RETRY_SECONDS=1800 CLAUDE_SMART_MAX_RETRIES=0 claude-smart
+```
+
+---
+
 ## Scripts
 
 ### AWS
