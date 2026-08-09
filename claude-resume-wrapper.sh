@@ -21,7 +21,8 @@
 #
 # The wrapper is for interactive, persistent local sessions. It rejects print,
 # background, cloud, remote-control, non-persistent, and forked session modes.
-# Claude must exit after showing a limit before the wrapper can begin waiting.
+# When Claude shows its rate-limit menu with "Stop and wait" already selected,
+# the wrapper confirms that safe option and periodically sends "continue".
 
 set -u
 
@@ -34,8 +35,9 @@ usage() {
 Usage: claude-smart [CLAUDE_OPTIONS] [PROMPT]
 
 Starts a fresh Claude Code session by default and passes interactive Claude
-options through. If Claude exits after reporting a usage limit, the command
-waits and resumes the same session.
+options through. At Claude's usage-limit menu, the wrapper selects the safe
+"Stop and wait" option and periodically sends "continue" until work can resume.
+If Claude exits on a limit instead, the wrapper relaunches the same session.
 
 Examples:
   claude-smart
@@ -136,8 +138,8 @@ if ! command -v claude >/dev/null 2>&1; then
     exit 127
 fi
 
-if ! command -v script >/dev/null 2>&1; then
-    echo "claude-smart: the script utility is required to preserve the interactive terminal" >&2
+if ! command -v expect >/dev/null 2>&1; then
+    echo "claude-smart: expect is required to monitor Claude's interactive terminal" >&2
     exit 127
 fi
 
@@ -151,39 +153,75 @@ if [[ ! -t 0 || ! -t 1 ]]; then
     exit 64
 fi
 
-log_file=$(mktemp "${TMPDIR:-/tmp}/claude-smart.XXXXXX") || exit 1
+expect_script=$(mktemp "${TMPDIR:-/tmp}/claude-smart.XXXXXX") || exit 1
 cleanup() {
-    rm -f "$log_file"
+    rm -f "$expect_script"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' HUP TERM
 
-quote_for_shell() {
-    local escaped=${1//\'/\'\\\'\'}
-    printf "'%s'" "$escaped"
+cat > "$expect_script" <<'EXPECT_CONTROLLER'
+set retry_seconds [lindex $argv 0]
+set max_retries [lindex $argv 1]
+set command [lrange $argv 2 end]
+set saw_limit 0
+set handled_menu 0
+set live_retry_count 0
+set retry_pending 0
+set timeout -1
+
+proc retry_paused_session {target_spawn_id} {
+    global retry_pending
+    set retry_pending 0
+    send_user "\nclaude-smart: retrying the paused Claude session.\n"
+    catch {send -i $target_spawn_id -- "continue\r"}
 }
+
+spawn -noecho {*}$command
+
+interact {
+    -o -re {(?i)(usage|rate|session)[ -]+limit.{0,40}(reached|exceeded)|you.?ve hit your.{0,20}limit|quota exceeded} {
+        send_user -- "$interact_out(0,string)"
+        set saw_limit 1
+    }
+    -re {(?i)[>❯][^\r\n]*Stop and wait for (the )?limit to reset} {
+        send_user -- "$interact_out(0,string)"
+        set saw_limit 1
+        set handled_menu 1
+        if {!$retry_pending} {
+            incr live_retry_count
+
+            if {$max_retries > 0 && $live_retry_count > $max_retries} {
+                send_user "\nclaude-smart: Claude still reports a usage limit after $max_retries retries; stopping.\n"
+                exit 75
+            }
+
+            send_user "\nclaude-smart: selecting 'Stop and wait'; retrying in $retry_seconds seconds.\n"
+            after 250
+            if {[catch {send -- "\r"}]} {
+                return
+            }
+            set retry_pending 1
+            after [expr {$retry_seconds * 1000}] [list retry_paused_session $spawn_id]
+        }
+    }
+    eof {
+        return
+    }
+}
+
+set wait_result [wait]
+set child_status [lindex $wait_result 3]
+
+if {$saw_limit && !$handled_menu} {
+    exit 75
+}
+exit $child_status
+EXPECT_CONTROLLER
 
 run_claude() {
-    local command_line=""
-    local command_part
-
-    : > "$log_file"
-
-    if [[ $(uname -s) == "Darwin" ]]; then
-        script -q -e "$log_file" "$@"
-    else
-        for command_part in "$@"; do
-            command_line+=" $(quote_for_shell "$command_part")"
-        done
-        script -q -e -c "exec$command_line" "$log_file"
-    fi
-}
-
-limit_was_reached() {
-    LC_ALL=C grep -aiEq \
-        "(usage|rate|session)[[:space:]-]+limit.{0,40}(reached|exceeded)|you.?ve hit your.{0,20}limit|quota exceeded|limit.{0,40}resets at" \
-        "$log_file"
+    expect "$expect_script" "$RETRY_SECONDS" "$MAX_RETRIES" "$@"
 }
 
 retry_count=0
@@ -213,7 +251,7 @@ while true; do
     run_claude "${current_command[@]}"
     claude_exit=$?
 
-    if limit_was_reached; then
+    if (( claude_exit == 75 )); then
         retry_count=$((retry_count + 1))
 
         if (( MAX_RETRIES > 0 && retry_count > MAX_RETRIES )); then

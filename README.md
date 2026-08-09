@@ -8,16 +8,17 @@ A collection of standalone Linux and AWS administration scripts.
 
 ### `claude-resume-wrapper.sh` — Claude Code usage-limit retry wrapper
 
-Starts a fresh, explicitly identified Claude Code session by default. If Claude
-reports a usage limit and exits, the wrapper retries that exact session rather
-than whichever session happens to be newest. Interactive Claude options pass
-through on the initial launch, and `--continue` or `--resume` can be used when
-you intentionally want an existing session. The wrapper preserves Claude's
-interactive terminal UI and stops on unrelated errors. By default it retries
-every 15 minutes, up to 24 times. If Claude remains open at its prompt after
-showing the limit, exit Claude normally to start the wait-and-retry cycle.
+Starts a fresh, explicitly identified Claude Code session by default. When
+Claude displays its rate-limit menu with the safe "Stop and wait" option
+selected, the wrapper confirms it and sends `continue` after each retry interval
+until the session can proceed. If Claude exits on a limit instead, the wrapper
+relaunches that exact session rather than whichever session happens to be
+newest. Interactive Claude options pass through on the initial launch, and
+`--continue` or `--resume` can be used when you intentionally want an existing
+session. The wrapper preserves Claude's interactive terminal UI and stops on
+unrelated errors. By default it retries every 15 minutes, up to 24 times.
 
-**Dependencies:** Claude Code, Bash, and the standard `script` utility
+**Dependencies:** Claude Code, Bash, `expect`, and `uuidgen`
 
 ```bash
 chmod +x claude-resume-wrapper.sh
