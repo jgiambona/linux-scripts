@@ -43,6 +43,42 @@ Non-interactive (`--print`), background, cloud, remote-control, non-persistent,
 and forked sessions are rejected because their lifecycle conflicts with this
 interactive auto-resume wrapper.
 
+### `gmail-draft` — Gmail drafts and sends with clean links (macOS)
+
+Creates, updates, lists, deletes and sends Gmail drafts through the standard
+Gmail API, and downloads attachments. It exists because the claude.ai Gmail
+connector rewrites every link into a `google.com/url?q=` redirect. This script
+sends a raw RFC 2822 message instead, then reads the stored draft back and
+refuses to send if any link was rewritten. Your Gmail signature is appended
+automatically, since Gmail only adds it in its own compose window. `delete`
+and `update` work on drafts only and refuse anything not labelled `DRAFT`.
+
+**Dependencies:** macOS (credentials live in the login Keychain), Python 3
+standard library only, and a Google Cloud OAuth client of type *Desktop app*
+with the Gmail API enabled.
+
+```bash
+ln -s "$PWD/gmail-draft" ~/.local/bin/gmail-draft
+
+# First run: sign in and store the client + refresh token in Keychain.
+gmail-draft auth --client-json ~/Desktop/client_secret_XXX.json
+# Later runs (e.g. after a scope change) reuse the stored client.
+gmail-draft auth
+
+gmail-draft create --to a@example.com --subject "Hi" --body-file body.txt
+gmail-draft create --reply-to MESSAGE_ID --reply-all --body-file body.txt --attach report.docx
+gmail-draft update DRAFT_ID --body-file revised.txt     # keeps recipients and thread
+gmail-draft list --query "to:a@example.com"
+gmail-draft delete DRAFT_ID
+gmail-draft send --to a@example.com --subject "Hi" --body-file body.txt
+gmail-draft fetch MESSAGE_ID --thread --out ~/Desktop/inbox-files
+```
+
+A draft can be named by its id (`r-123...`) or by the message id at the end
+of a Gmail `#drafts?compose=` URL. `fetch` skips inline images such as
+signature logos unless `--include-inline` is passed, and never overwrites a
+file. Scopes: `gmail.compose`, `gmail.readonly`, `gmail.settings.basic`.
+
 ---
 
 ## Scripts
