@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""Draft, send and manage Gmail mail through the standard Gmail API, so links stay clean.
+
+The claude.ai Gmail connector (Google's hosted Gmail MCP server) rewrites every
+URL into a google.com/url?q= redirect when it stores a message. The standard
+API with a raw RFC 2822 message does not. `create` makes a draft and is the
+default; `send` makes the same draft, verifies it, then sends that draft, so a
+message whose links were rewritten is never sent.
+
+  gmail-draft auth [--client-json ~/Desktop/client_secret_XXX.json]   # once; re-run to add scopes
+  gmail-draft create --to a@b.com --subject "Hi" --body-file body.txt [--html-file body.html]
+  gmail-draft create --reply-to <message id> [--reply-all] --body-file body.txt
+  gmail-draft create --reply-to <id> --body-file body.txt --attach file.docx [--attach more.pdf]
+  echo "text" | gmail-draft create --to a@b.com --subject "Hi"
+  gmail-draft send --to a@b.com --subject "Hi" --body-file body.txt   # only when asked to send
+  gmail-draft update <draft> --body-file body.txt [--attach ...]       # revise a draft in place
+  gmail-draft list [--query "to:a@b.com"]
+  gmail-draft delete <draft> [...]                                     # drafts only
+  gmail-draft fetch <message id> --out DIR [--thread] [--include-inline]
+
+<draft> is a draft id (r-123...) or the message id at the end of a
+#drafts?compose= URL. Your Gmail signature is appended by default
+(--no-signature to skip).
+
+Credentials live in the macOS login Keychain, service "gmail-draft":
+client_id, client_secret, refresh_token. Stdlib only.
+"""
+
+import argparse
+import base64
+import hashlib
+import html as htmllib
+import http.server
+import json
+import mimetypes
+import os
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from email import policy
+from email.message import EmailMessage
+from email.parser import BytesParser
+from email.utils import getaddresses
+
+KEYCHAIN_SERVICE = "gmail-draft"
+SCOPES = " ".join([
+    "https://www.googleapis.com/auth/gmail.compose",         # drafts: create, update, send, delete
+    "https://www.googleapis.com/auth/gmail.readonly",        # reply headers, fetch attachments
+    "https://www.googleapis.com/auth/gmail.settings.basic",  # read the send-as signature
+])
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+API = "https://gmail.googleapis.com/gmail/v1/users/me"
+REDIRECT_MARKER = "google.com/url?q="
+# Keychain values go through `security -i` on stdin (never argv), so restrict
+# them to characters that need no quoting there.
+SAFE_SECRET = re.compile(r"^[A-Za-z0-9._/~+=-]+$")
+
+
+def die(msg):
+    print(f"gmail-draft: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def keychain_get(account, required=True):
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        if not required:
+            return None
+        die(f"no '{account}' in Keychain service '{KEYCHAIN_SERVICE}'; run `gmail-draft auth` first")
+    return result.stdout.strip()
+
+
+def keychain_set(account, value):
+    if not SAFE_SECRET.match(value):
+        die(f"refusing to store '{account}': unexpected characters")
+    command = f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -w "{value}"\n'
+    result = subprocess.run(["security", "-i"], input=command, capture_output=True, text=True)
+    if result.returncode != 0 or "error" in result.stderr.lower():
+        die(f"Keychain write failed for '{account}': {result.stderr.strip()}")
+
+
+def post_form(url, fields):
+    data = urllib.parse.urlencode(fields).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data)) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        die(f"POST {url} failed: {e.code} {e.read().decode(errors='replace')}")
+
+
+def api(method, path, token, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"{API}{path}", data=data, method=method)
+    req.add_header("Authorization", f"Bearer {token}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        if e.code == 403 and "insufficient" in detail.lower():
+            die(f"{method} {path}: the stored sign-in lacks a permission this command needs; "
+                "run `gmail-draft auth` once to grant it")
+        die(f"{method} {path} failed: {e.code} {detail}")
+
+
+def access_token():
+    resp = post_form(TOKEN_URL, {
+        "client_id": keychain_get("client_id"),
+        "client_secret": keychain_get("client_secret"),
+        "refresh_token": keychain_get("refresh_token"),
+        "grant_type": "refresh_token",
+    })
+    return resp["access_token"]
+
+
+def cmd_auth(args):
+    if args.client_json:
+        with open(args.client_json) as f:
+            client = json.load(f).get("installed")
+        if not client:
+            die("client JSON has no 'installed' block; create an OAuth client of type Desktop app")
+    else:
+        # Re-authorising (e.g. to add scopes) reuses the stored client, whose
+        # secret Google Cloud Console cannot show again.
+        client_id, client_secret = keychain_get("client_id", False), keychain_get("client_secret", False)
+        if not (client_id and client_secret):
+            die("no stored OAuth client; pass --client-json the first time")
+        client = {"client_id": client_id, "client_secret": client_secret}
+
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    received = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            received.update({k: v[0] for k, v in query.items()})
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"gmail-draft: authorised. You can close this tab.")
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    redirect_uri = f"http://127.0.0.1:{server.server_port}"
+    url = AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": client["client_id"],
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    })
+    thread = threading.Thread(target=server.handle_request)
+    thread.start()
+    print(f"Opening browser to authorise. If it does not open, visit:\n{url}")
+    webbrowser.open(url)
+    thread.join()
+    server.server_close()
+
+    if received.get("state") != state:
+        die("OAuth state mismatch; aborting")
+    if "code" not in received:
+        die(f"authorisation failed: {received.get('error', 'no code returned')}")
+
+    resp = post_form(TOKEN_URL, {
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "code": received["code"],
+        "code_verifier": verifier,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri,
+    })
+    if "refresh_token" not in resp:
+        die("no refresh_token returned; revoke the app at myaccount.google.com/permissions and retry")
+
+    keychain_set("client_id", client["client_id"])
+    keychain_set("client_secret", client["client_secret"])
+    keychain_set("refresh_token", resp["refresh_token"])
+    print(f"Stored credentials in Keychain service '{KEYCHAIN_SERVICE}'.")
+
+
+# --- composing --------------------------------------------------------------
+
+def header_map(message_or_part):
+    """Lower-cased headers of a message resource, or of one of its MIME parts."""
+    part = message_or_part.get("payload", message_or_part)
+    return {h["name"].lower(): h["value"] for h in part.get("headers", [])}
+
+
+def my_addresses(token):
+    profile = api("GET", "/profile", token)
+    send_as = api("GET", "/settings/sendAs", token).get("sendAs", [])
+    return {profile["emailAddress"].lower()} | {s["sendAsEmail"].lower() for s in send_as}
+
+
+def reply_defaults(args, token):
+    original = api("GET", f"/messages/{args.reply_to}?format=metadata"
+                   "&metadataHeaders=Message-ID&metadataHeaders=References"
+                   "&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Reply-To"
+                   "&metadataHeaders=To&metadataHeaders=Cc", token)
+    headers = header_map(original)
+    message_id = headers.get("message-id", "")
+    subject = headers.get("subject", "")
+    if not re.match(r"^re:", subject, re.IGNORECASE):
+        subject = f"Re: {subject}"
+    mine = my_addresses(token)
+
+    def others(*fields):
+        out, seen = [], set()
+        for name, addr in getaddresses([headers.get(f, "") for f in fields]):
+            if addr and addr.lower() not in mine and addr.lower() not in seen:
+                seen.add(addr.lower())
+                out.append(f'"{name}" <{addr}>' if name else addr)
+        return out
+
+    from_addr = (getaddresses([headers.get("from", "")]) or [("", "")])[0][1].lower()
+    if from_addr in mine:
+        # Replying to your own message goes to its recipients, as Gmail does.
+        to, cc = others("to"), others("cc") if args.reply_all else []
+    else:
+        to = [headers.get("reply-to") or headers.get("from", "")]
+        cc = []
+        if args.reply_all:
+            taken = {addr.lower() for _, addr in getaddresses(to)}
+            cc = [a for a in others("to", "cc") if getaddresses([a])[0][1].lower() not in taken]
+    if not to:
+        die("could not work out who to reply to; pass --to")
+    return {
+        "to": to, "cc": cc, "subject": subject, "thread_id": original["threadId"],
+        "in_reply_to": message_id,
+        "references": f"{headers.get('references', '')} {message_id}".strip(),
+    }
+
+
+def html_to_text(fragment):
+    text = re.sub(r"(?i)<br\s*/?>|</(div|p|tr|li|h\d)>", "\n", fragment)
+    text = re.sub(r"(?s)<[^>]+>", "", text)
+    text = htmllib.unescape(text).replace("\xa0", " ")
+    lines = [line.rstrip() for line in text.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def text_to_html(text):
+    escaped = htmllib.escape(text)
+    linked = re.sub(r"(https?://[^\s<]+[^\s<.,;:!?)\]'\"])", r'<a href="\1">\1</a>', escaped)
+    return f'<div dir="ltr">{linked.replace(chr(10), "<br>")}</div>'
+
+
+def default_signature(token):
+    for entry in api("GET", "/settings/sendAs", token).get("sendAs", []):
+        if entry.get("isDefault"):
+            return entry.get("signature", "")
+    return ""
+
+
+def build_message(args, token, defaults=None):
+    body = open(args.body_file).read() if args.body_file else sys.stdin.read()
+    if getattr(args, "reply_to", None):
+        defaults = reply_defaults(args, token)
+    defaults = defaults or {}
+
+    to = args.to or defaults.get("to")
+    subject = args.subject or defaults.get("subject")
+    if not to or not subject:
+        die("--to and --subject are required unless --reply-to is given")
+    cc = (defaults.get("cc") or []) + (args.cc or [])
+
+    msg = EmailMessage()
+    if defaults.get("in_reply_to"):
+        msg["In-Reply-To"] = defaults["in_reply_to"]
+        msg["References"] = defaults["references"]
+    msg["To"] = ", ".join(to)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    if args.bcc:
+        msg["Bcc"] = ", ".join(args.bcc)
+    msg["Subject"] = subject
+
+    html_body = open(args.html_file).read() if args.html_file else None
+    signature = "" if args.no_signature or token is None else default_signature(token)
+    if signature:
+        # Gmail only adds the signature in its own compose window, so add it here.
+        base_html = html_body if html_body is not None else text_to_html(body.rstrip())
+        sig_block = f"<br><br>{signature}"
+        if re.search(r"(?i)</body>", base_html):
+            html_body = re.sub(r"(?i)</body>", lambda m: sig_block + m.group(0), base_html, count=1)
+        else:
+            html_body = base_html + sig_block
+        body = f"{body.rstrip()}\n\n{html_to_text(signature)}\n"
+    msg.set_content(body)
+    if html_body is not None:
+        msg.add_alternative(html_body, subtype="html")
+
+    for path in args.attach or []:
+        ctype, encoding = mimetypes.guess_type(path)
+        if ctype is None or encoding is not None:
+            ctype = "application/octet-stream"
+        maintype, subtype = ctype.split("/", 1)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            die(f"cannot read attachment {path}: {e}")
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=os.path.basename(path))
+    return msg, defaults.get("thread_id")
+
+
+def serialise(msg):
+    # Long attachment MIME types (e.g. .docx) get RFC 2047-mangled when folded
+    # at 78 columns; 998 is the RFC 5322 hard limit.
+    return msg.as_bytes(policy=policy.SMTP.clone(max_line_length=998))
+
+
+def text_parts(raw):
+    """Decoded text of every text/* part, so transfer encoding can't hide a redirect."""
+    parsed = BytesParser(policy=policy.default).parsebytes(raw)
+    return "\n".join(p.get_content() for p in parsed.walk()
+                     if p.get_content_maintype() == "text" and not p.is_attachment())
+
+
+def verify_stored(token, draft_id, raw_bytes):
+    """Prove the stored copy kept its links, rather than trusting the write path."""
+    stored = api("GET", f"/drafts/{draft_id}?format=raw", token)
+    stored_text = text_parts(base64.urlsafe_b64decode(stored["message"]["raw"]))
+    if REDIRECT_MARKER in stored_text and REDIRECT_MARKER not in text_parts(raw_bytes):
+        die(f"draft {draft_id} was stored with google.com/url redirects; not sent, left as a draft")
+
+
+def payload_for(msg, thread_id):
+    raw_bytes = serialise(msg)
+    payload = {"raw": base64.urlsafe_b64encode(raw_bytes).decode()}
+    if thread_id:
+        payload["threadId"] = thread_id
+    return payload, raw_bytes
+
+
+def cmd_create(args, send=False):
+    token = None if args.dry_run and not args.reply_to else access_token()
+    msg, thread_id = build_message(args, token)
+    payload, raw_bytes = payload_for(msg, thread_id)
+    if args.dry_run:
+        sys.stdout.write(raw_bytes.decode())
+        return
+
+    draft = api("POST", "/drafts", token, {"message": payload})
+    verify_stored(token, draft["id"], raw_bytes)
+
+    if send:
+        sent = api("POST", "/drafts/send", token, {"id": draft["id"]})
+        print(f"Sent message {sent['id']} (thread {sent['threadId']}), links verified clean.")
+        return
+
+    print(f"Draft {draft['id']} created, links verified clean.")
+    print(f"https://mail.google.com/mail/u/0/#drafts?compose={draft['message']['id']}")
+
+
+# --- managing drafts --------------------------------------------------------
+
+def resolve_draft(token, ref):
+    """Map a draft id or a compose-URL message id to a draft; never a non-draft."""
+    draft_id = ref
+    if not ref.startswith("r"):
+        listing = api("GET", "/drafts?maxResults=500", token)
+        matches = [d["id"] for d in listing.get("drafts", []) if d["message"]["id"] == ref]
+        if not matches:
+            die(f"{ref} is not a draft (no draft holds that message id); nothing changed")
+        draft_id = matches[0]
+    draft = api("GET", f"/drafts/{draft_id}?format=metadata", token)
+    if "DRAFT" not in draft["message"].get("labelIds", []):
+        die(f"{draft_id} is not labelled DRAFT; refusing to touch it")
+    return draft
+
+
+def cmd_update(args):
+    token = access_token()
+    draft = resolve_draft(token, args.draft)
+    headers = header_map(draft["message"])
+    defaults = {
+        "to": [headers["to"]] if headers.get("to") else None,
+        "cc": [headers["cc"]] if headers.get("cc") and not args.cc else [],
+        "subject": headers.get("subject"),
+        "thread_id": draft["message"].get("threadId"),
+        "in_reply_to": headers.get("in-reply-to"),
+        "references": headers.get("references", headers.get("in-reply-to", "")),
+    }
+    msg, thread_id = build_message(args, token, defaults)
+    payload, raw_bytes = payload_for(msg, thread_id)
+    updated = api("PUT", f"/drafts/{draft['id']}", token, {"id": draft["id"], "message": payload})
+    verify_stored(token, updated["id"], raw_bytes)
+    print(f"Draft {updated['id']} updated, links verified clean.")
+    print(f"https://mail.google.com/mail/u/0/#drafts?compose={updated['message']['id']}")
+
+
+def cmd_list(args):
+    token = access_token()
+    query = f"&q={urllib.parse.quote(args.query)}" if args.query else ""
+    listing = api("GET", f"/drafts?maxResults={args.limit}{query}", token)
+    for d in listing.get("drafts", []):
+        full = api("GET", f"/drafts/{d['id']}?format=metadata&metadataHeaders=To"
+                   "&metadataHeaders=Subject&metadataHeaders=Date", token)
+        h = header_map(full["message"])
+        print(f"{d['id']}\t{d['message']['id']}\t{h.get('date', '')}\t{h.get('to', '')}\t{h.get('subject', '')}")
+
+
+def cmd_delete(args):
+    """Delete drafts only. Goes through the /drafts endpoint, which cannot
+    address a sent or received message, and shows each draft before removing it."""
+    token = access_token()
+    for ref in args.draft:
+        draft = resolve_draft(token, ref)
+        headers = header_map(draft["message"])
+        api("DELETE", f"/drafts/{draft['id']}", token)
+        print(f"Deleted draft {draft['id']}: to {headers.get('to', '?')}, subject {headers.get('subject', '?')!r}")
+
+
+# --- attachments --------------------------------------------------------------
+
+def attachment_parts(part):
+    if part.get("filename") and part.get("body", {}).get("attachmentId"):
+        yield part
+    for child in part.get("parts", []) or []:
+        yield from attachment_parts(child)
+
+
+def safe_name(filename, taken, out_dir):
+    name = os.path.basename(filename.replace("\\", "/")).strip() or "attachment"
+    if name in (".", ".."):
+        name = "attachment"
+    stem, ext = os.path.splitext(name)
+    candidate, n = name, 1
+    while candidate in taken or os.path.exists(os.path.join(out_dir, candidate)):
+        candidate = f"{stem} ({n}){ext}"
+        n += 1
+    taken.add(candidate)
+    return candidate
+
+
+def cmd_fetch(args):
+    token = access_token()
+    if args.thread:
+        messages = api("GET", f"/threads/{args.message}?format=full", token)["messages"]
+    else:
+        messages = [api("GET", f"/messages/{args.message}?format=full", token)]
+    os.makedirs(args.out, exist_ok=True)
+    taken, saved = set(), 0
+    for message in messages:
+        for part in attachment_parts(message["payload"]):
+            disposition = header_map(part).get("content-disposition", "")
+            if disposition.lower().startswith("inline") and not args.include_inline:
+                continue
+            data = api("GET", f"/messages/{message['id']}/attachments/{part['body']['attachmentId']}", token)
+            name = safe_name(part["filename"], taken, args.out)
+            path = os.path.join(args.out, name)
+            with open(path, "xb") as f:
+                f.write(base64.urlsafe_b64decode(data["data"]))
+            saved += 1
+            print(path)
+    if not saved:
+        print("No attachments (inline images skipped; pass --include-inline to keep them).", file=sys.stderr)
+
+
+# --- CLI ----------------------------------------------------------------------
+
+def add_compose_args(p, draft_ref=False):
+    if draft_ref:
+        p.add_argument("draft", help="draft id (r-123...) or the message id from a #drafts?compose= URL")
+    p.add_argument("--to", action="append", help="recipient; repeat for several")
+    p.add_argument("--cc", action="append")
+    p.add_argument("--bcc", action="append")
+    p.add_argument("--subject")
+    p.add_argument("--body-file", help="plain-text body; reads stdin if omitted")
+    p.add_argument("--html-file", help="optional HTML alternative")
+    p.add_argument("--attach", action="append", help="file to attach; repeat for several")
+    p.add_argument("--no-signature", action="store_true", help="do not append the Gmail signature")
+    if not draft_ref:
+        p.add_argument("--reply-to", help="Gmail message id to reply to; threads the message")
+        p.add_argument("--reply-all", action="store_true", help="with --reply-to, Cc the original To/Cc")
+        p.add_argument("--dry-run", action="store_true", help="print the MIME instead of creating")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    auth = sub.add_parser("auth", help="OAuth sign-in; stores credentials in Keychain (re-run to add scopes)")
+    auth.add_argument("--client-json", help="Desktop-app OAuth client JSON (first run only)")
+    auth.set_defaults(func=cmd_auth)
+
+    for name, help_text, send in (
+        ("create", "create a draft (the default; never sends)", False),
+        ("send", "create, verify, then send; only when explicitly asked to send", True),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        add_compose_args(p)
+        p.set_defaults(func=lambda args, send=send: cmd_create(args, send))
+
+    update = sub.add_parser("update", help="replace a draft's body/attachments; keeps its recipients and thread")
+    add_compose_args(update, draft_ref=True)
+    update.set_defaults(func=cmd_update, reply_to=None, reply_all=False, dry_run=False)
+
+    lst = sub.add_parser("list", help="list drafts: id, message id, date, to, subject")
+    lst.add_argument("--query", help="Gmail search, e.g. 'to:a@b.com'")
+    lst.add_argument("--limit", type=int, default=25)
+    lst.set_defaults(func=cmd_list)
+
+    delete = sub.add_parser("delete", help="delete drafts (never sent or received mail)")
+    delete.add_argument("draft", nargs="+", help="draft id (r-123...) or the message id from a #drafts?compose= URL")
+    delete.set_defaults(func=cmd_delete)
+
+    fetch = sub.add_parser("fetch", help="download a message's attachments")
+    fetch.add_argument("message", help="Gmail message id (or thread id with --thread)")
+    fetch.add_argument("--out", required=True, help="directory to save into (never overwrites)")
+    fetch.add_argument("--thread", action="store_true", help="fetch from every message in the thread")
+    fetch.add_argument("--include-inline", action="store_true", help="also save inline images (signatures, logos)")
+    fetch.set_defaults(func=cmd_fetch)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
