@@ -24,7 +24,7 @@ A collection of standalone Linux and AWS administration scripts. There is no bui
 | `route53-export-bind.sh` | Another older Route 53 export — hardcodes `--profile ndc`, supports `--id`/`--domain`, raw jq output | AWS (legacy) |
 | `s3_delete_all_buckets.sh` | Deletes all S3 buckets under a profile, including versioned objects and delete markers. Retries on throttling. | AWS |
 | `wb_admin_export.py` | Patched MySQL Workbench export module for older MySQL compatibility. Drop-in replacement for `/usr/lib64/mysql-workbench/modules/wb_admin_export.py`. | MySQL Workbench |
-| `gmail-draft` | Gmail drafts/sends via the standard API with clean links, signature, attachments, reply-all; drafts-only `update`/`delete`; `fetch` downloads attachments. Python stdlib; credentials in the macOS Keychain. Symlinked into `~/.local/bin`, so edits here are live. | macOS |
+| `gmail-draft` | Gmail drafts/sends via the standard API with clean links, signature, attachments, reply-all; drafts-only `update`/`delete`/`send-draft`; `fetch` downloads attachments. Python stdlib; credentials in the macOS Keychain. Symlinked into `~/.local/bin`, so edits here are live. | macOS |
 
 ## Hardcoded values to be aware of
 

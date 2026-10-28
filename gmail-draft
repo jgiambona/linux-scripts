@@ -5,7 +5,9 @@ The claude.ai Gmail connector (Google's hosted Gmail MCP server) rewrites every
 URL into a google.com/url?q= redirect when it stores a message. The standard
 API with a raw RFC 2822 message does not. `create` makes a draft and is the
 default; `send` makes the same draft, verifies it, then sends that draft, so a
-message whose links were rewritten is never sent.
+message whose links were rewritten is never sent. `send-draft` sends a draft
+that already exists (made here, in Gmail, or by the connector) after the same
+check.
 
   gmail-draft auth [--client-json ~/Desktop/client_secret_XXX.json]   # once; re-run to add scopes
   gmail-draft create --to a@b.com --subject "Hi" --body-file body.txt [--html-file body.html]
@@ -16,6 +18,7 @@ message whose links were rewritten is never sent.
   gmail-draft update <draft> --body-file body.txt [--attach ...]       # revise a draft in place
   gmail-draft list [--query "to:a@b.com"]
   gmail-draft delete <draft> [...]                                     # drafts only
+  gmail-draft send-draft <draft>                                       # send a saved draft as-is
   gmail-draft fetch <message id> --out DIR [--thread] [--include-inline]
 
 <draft> is a draft id (r-123...) or the message id at the end of a
@@ -337,11 +340,14 @@ def text_parts(raw):
                      if p.get_content_maintype() == "text" and not p.is_attachment())
 
 
+def stored_text(token, draft_id):
+    stored = api("GET", f"/drafts/{draft_id}?format=raw", token)
+    return text_parts(base64.urlsafe_b64decode(stored["message"]["raw"]))
+
+
 def verify_stored(token, draft_id, raw_bytes):
     """Prove the stored copy kept its links, rather than trusting the write path."""
-    stored = api("GET", f"/drafts/{draft_id}?format=raw", token)
-    stored_text = text_parts(base64.urlsafe_b64decode(stored["message"]["raw"]))
-    if REDIRECT_MARKER in stored_text and REDIRECT_MARKER not in text_parts(raw_bytes):
+    if REDIRECT_MARKER in stored_text(token, draft_id) and REDIRECT_MARKER not in text_parts(raw_bytes):
         die(f"draft {draft_id} was stored with google.com/url redirects; not sent, left as a draft")
 
 
@@ -408,6 +414,21 @@ def cmd_update(args):
     verify_stored(token, updated["id"], raw_bytes)
     print(f"Draft {updated['id']} updated, links verified clean.")
     print(f"https://mail.google.com/mail/u/0/#drafts?compose={updated['message']['id']}")
+
+
+def cmd_send_draft(args):
+    """Send an existing draft unchanged. There is no original to compare it
+    with, so any google.com/url redirect in it blocks the send unless
+    --allow-redirects says the redirect is meant to be there."""
+    token = access_token()
+    draft = resolve_draft(token, args.draft)
+    if REDIRECT_MARKER in stored_text(token, draft["id"]) and not args.allow_redirects:
+        die(f"draft {draft['id']} contains google.com/url redirects (the connector rewrites links); "
+            "not sent. Fix the links in Gmail, or pass --allow-redirects to send it anyway")
+    headers = header_map(draft["message"])
+    sent = api("POST", "/drafts/send", token, {"id": draft["id"]})
+    print(f"Sent draft {draft['id']} as message {sent['id']} (thread {sent['threadId']}): "
+          f"to {headers.get('to', '?')}, subject {headers.get('subject', '?')!r}")
 
 
 def cmd_list(args):
@@ -516,6 +537,12 @@ def main():
     update = sub.add_parser("update", help="replace a draft's body/attachments; keeps its recipients and thread")
     add_compose_args(update, draft_ref=True)
     update.set_defaults(func=cmd_update, reply_to=None, reply_all=False, dry_run=False)
+
+    send_draft = sub.add_parser("send-draft", help="send a saved draft as-is, after checking its links")
+    send_draft.add_argument("draft", help="draft id (r-123...) or the message id from a #drafts?compose= URL")
+    send_draft.add_argument("--allow-redirects", action="store_true",
+                            help="send even if the draft contains google.com/url redirects")
+    send_draft.set_defaults(func=cmd_send_draft)
 
     lst = sub.add_parser("list", help="list drafts: id, message id, date, to, subject")
     lst.add_argument("--query", help="Gmail search, e.g. 'to:a@b.com'")
