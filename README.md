@@ -50,8 +50,11 @@ Gmail API, and downloads attachments. It exists because the claude.ai Gmail
 connector rewrites every link into a `google.com/url?q=` redirect. This script
 sends a raw RFC 2822 message instead, then reads the stored draft back and
 refuses to send if any link was rewritten. Your Gmail signature is appended
-automatically, since Gmail only adds it in its own compose window. `delete`
-and `update` work on drafts only and refuse anything not labelled `DRAFT`.
+automatically, since Gmail only adds it in its own compose window. `delete`,
+`update` and `send-draft` work on drafts only and refuse anything not labelled
+`DRAFT`. `send-draft` sends a draft that already exists, wherever it was made,
+and refuses one containing `google.com/url?q=` redirects unless
+`--allow-redirects` is passed.
 
 **Dependencies:** macOS (credentials live in the login Keychain), Python 3
 standard library only, and a Google Cloud OAuth client of type *Desktop app*
@@ -71,6 +74,7 @@ gmail-draft update DRAFT_ID --body-file revised.txt     # keeps recipients and t
 gmail-draft list --query "to:a@example.com"
 gmail-draft delete DRAFT_ID
 gmail-draft send --to a@example.com --subject "Hi" --body-file body.txt
+gmail-draft send-draft DRAFT_ID                          # send a saved draft as-is
 gmail-draft fetch MESSAGE_ID --thread --out ~/Desktop/inbox-files
 ```
 
