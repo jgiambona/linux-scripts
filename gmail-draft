@@ -25,8 +25,10 @@ check.
 #drafts?compose= URL. Your Gmail signature is appended by default
 (--no-signature to skip).
 
-Credentials live in the macOS login Keychain, service "gmail-draft":
-client_id, client_secret, refresh_token. Stdlib only.
+Credentials (client_id, client_secret, refresh_token) live in the macOS login
+Keychain, service "gmail-draft", or on Windows in Credential Manager as
+"gmail-draft:<name>" generic credentials. Stdlib only. On Windows run it as
+`py gmail-draft ...` (see the README for setup).
 """
 
 import argparse
@@ -52,6 +54,8 @@ from email.parser import BytesParser
 from email.utils import getaddresses
 
 KEYCHAIN_SERVICE = "gmail-draft"
+WINDOWS = sys.platform == "win32"
+STORE_NAME = "Windows Credential Manager" if WINDOWS else "Keychain"
 SCOPES = " ".join([
     "https://www.googleapis.com/auth/gmail.compose",         # drafts: create, update, send, delete
     "https://www.googleapis.com/auth/gmail.readonly",        # reply headers, fetch attachments
@@ -71,7 +75,53 @@ def die(msg):
     sys.exit(1)
 
 
+def _win_cred_api():
+    """CredReadW/CredWriteW from advapi32, via ctypes so the script stays stdlib-only."""
+    import ctypes
+    from ctypes import wintypes
+
+    class CREDENTIAL(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD), ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR), ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME), ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_char)), ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD), ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR), ("UserName", wintypes.LPWSTR),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.POINTER(ctypes.POINTER(CREDENTIAL))]
+    advapi32.CredReadW.restype = wintypes.BOOL
+    advapi32.CredWriteW.argtypes = [ctypes.POINTER(CREDENTIAL), wintypes.DWORD]
+    advapi32.CredWriteW.restype = wintypes.BOOL
+    advapi32.CredFree.argtypes = [ctypes.c_void_p]
+    return ctypes, CREDENTIAL, advapi32
+
+
+CRED_TYPE_GENERIC = 1
+CRED_PERSIST_LOCAL_MACHINE = 2  # survives reboot, stays on this PC (not roamed)
+
+
+def _win_target(account):
+    return f"{KEYCHAIN_SERVICE}:{account}"
+
+
 def keychain_get(account, required=True):
+    if WINDOWS:
+        ctypes, CREDENTIAL, advapi32 = _win_cred_api()
+        cred = ctypes.POINTER(CREDENTIAL)()
+        if advapi32.CredReadW(_win_target(account), CRED_TYPE_GENERIC, 0, ctypes.byref(cred)):
+            try:
+                c = cred.contents
+                return ctypes.string_at(c.CredentialBlob, c.CredentialBlobSize).decode()
+            finally:
+                advapi32.CredFree(cred)
+        if not required:
+            return None
+        die(f"no '{account}' in {STORE_NAME} ('{_win_target(account)}'); run `gmail-draft auth` first")
+
     result = subprocess.run(
         ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
         capture_output=True, text=True,
@@ -86,6 +136,20 @@ def keychain_get(account, required=True):
 def keychain_set(account, value):
     if not SAFE_SECRET.match(value):
         die(f"refusing to store '{account}': unexpected characters")
+    if WINDOWS:
+        ctypes, CREDENTIAL, advapi32 = _win_cred_api()
+        blob = value.encode()
+        cred = CREDENTIAL()
+        cred.Type = CRED_TYPE_GENERIC
+        cred.TargetName = _win_target(account)
+        cred.UserName = account
+        cred.CredentialBlobSize = len(blob)
+        cred.CredentialBlob = ctypes.cast(ctypes.create_string_buffer(blob, len(blob)),
+                                          ctypes.POINTER(ctypes.c_char))
+        cred.Persist = CRED_PERSIST_LOCAL_MACHINE
+        if not advapi32.CredWriteW(ctypes.byref(cred), 0):
+            die(f"{STORE_NAME} write failed for '{account}': error {ctypes.get_last_error()}")
+        return
     command = f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -w "{value}"\n'
     result = subprocess.run(["security", "-i"], input=command, capture_output=True, text=True)
     if result.returncode != 0 or "error" in result.stderr.lower():
@@ -131,7 +195,7 @@ def access_token():
 
 def cmd_auth(args):
     if args.client_json:
-        with open(args.client_json) as f:
+        with open(args.client_json, encoding="utf-8") as f:
             client = json.load(f).get("installed")
         if not client:
             die("client JSON has no 'installed' block; create an OAuth client of type Desktop app")
@@ -198,7 +262,7 @@ def cmd_auth(args):
     keychain_set("client_id", client["client_id"])
     keychain_set("client_secret", client["client_secret"])
     keychain_set("refresh_token", resp["refresh_token"])
-    print(f"Stored credentials in Keychain service '{KEYCHAIN_SERVICE}'.")
+    print(f"Stored credentials in {STORE_NAME} ('{KEYCHAIN_SERVICE}').")
 
 
 # --- composing --------------------------------------------------------------
@@ -276,7 +340,7 @@ def default_signature(token):
 
 
 def build_message(args, token, defaults=None):
-    body = open(args.body_file).read() if args.body_file else sys.stdin.read()
+    body = open(args.body_file, encoding="utf-8").read() if args.body_file else sys.stdin.read()
     if getattr(args, "reply_to", None):
         defaults = reply_defaults(args, token)
     defaults = defaults or {}
@@ -298,7 +362,7 @@ def build_message(args, token, defaults=None):
         msg["Bcc"] = ", ".join(args.bcc)
     msg["Subject"] = subject
 
-    html_body = open(args.html_file).read() if args.html_file else None
+    html_body = open(args.html_file, encoding="utf-8").read() if args.html_file else None
     signature = "" if args.no_signature or token is None else default_signature(token)
     if signature:
         # Gmail only adds the signature in its own compose window, so add it here.
@@ -519,10 +583,15 @@ def add_compose_args(p, draft_ref=False):
 
 
 def main():
+    if WINDOWS:
+        # Windows consoles and pipes default to a legacy code page; bodies,
+        # subjects and names here are UTF-8 (e.g. em dashes, accented names).
+        for stream in (sys.stdin, sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    auth = sub.add_parser("auth", help="OAuth sign-in; stores credentials in Keychain (re-run to add scopes)")
+    auth = sub.add_parser("auth", help="OAuth sign-in; stores credentials in Keychain / Credential Manager (re-run to add scopes)")
     auth.add_argument("--client-json", help="Desktop-app OAuth client JSON (first run only)")
     auth.set_defaults(func=cmd_auth)
 
