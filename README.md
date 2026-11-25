@@ -43,7 +43,7 @@ Non-interactive (`--print`), background, cloud, remote-control, non-persistent,
 and forked sessions are rejected because their lifecycle conflicts with this
 interactive auto-resume wrapper.
 
-### `gmail-draft` — Gmail drafts and sends with clean links (macOS)
+### `gmail-draft` — Gmail drafts and sends with clean links (macOS, Windows)
 
 Creates, updates, lists, deletes and sends Gmail drafts through the standard
 Gmail API, and downloads attachments. It exists because the claude.ai Gmail
@@ -56,9 +56,11 @@ automatically, since Gmail only adds it in its own compose window. `delete`,
 and refuses one containing `google.com/url?q=` redirects unless
 `--allow-redirects` is passed.
 
-**Dependencies:** macOS (credentials live in the login Keychain), Python 3
-standard library only, and a Google Cloud OAuth client of type *Desktop app*
-with the Gmail API enabled.
+**Dependencies:** Python 3 standard library only, and a Google Cloud OAuth
+client of type *Desktop app* with the Gmail API enabled. Credentials live in
+the macOS login Keychain, or on Windows in Credential Manager (generic
+credentials named `gmail-draft:client_id`, `gmail-draft:client_secret` and
+`gmail-draft:refresh_token`).
 
 ```bash
 ln -s "$PWD/gmail-draft" ~/.local/bin/gmail-draft
@@ -77,6 +79,39 @@ gmail-draft send --to a@example.com --subject "Hi" --body-file body.txt
 gmail-draft send-draft DRAFT_ID                          # send a saved draft as-is
 gmail-draft fetch MESSAGE_ID --thread --out ~/Desktop/inbox-files
 ```
+
+#### Windows
+
+1. Install Python 3 from [python.org](https://www.python.org/downloads/windows/)
+   (the installer's default options include the `py` launcher).
+2. Save the script, without a file extension, to a folder of its own:
+
+   ```powershell
+   mkdir $HOME\tools
+   Invoke-WebRequest https://raw.githubusercontent.com/jgiambona/linux-scripts/master/gmail-draft -OutFile $HOME\tools\gmail-draft
+   ```
+
+3. Sign in once. A browser tab opens; choose your work Google account and
+   allow access:
+
+   ```powershell
+   py $HOME\tools\gmail-draft auth --client-json $HOME\Downloads\client_secret_XXX.json
+   ```
+
+   Then delete the client JSON file; the credentials are stored in
+   Credential Manager.
+
+4. Use it the same way as on a Mac, with `py $HOME\tools\gmail-draft` in place
+   of `gmail-draft`:
+
+   ```powershell
+   py $HOME\tools\gmail-draft create --to a@example.com --subject "Hi" --body-file body.txt
+   ```
+
+Body and HTML files are read as UTF-8. To update, repeat the
+`Invoke-WebRequest` line. To remove the stored sign-in, delete the three
+`gmail-draft:` entries in Control Panel → Credential Manager → Windows
+Credentials, and remove the app at myaccount.google.com/permissions.
 
 A draft can be named by its id (`r-123...`) or by the message id at the end
 of a Gmail `#drafts?compose=` URL. `fetch` skips inline images such as
