@@ -1,0 +1,33 @@
+name: gmail-draft on Windows
+
+on:
+  push:
+    paths: [gmail-draft, .github/workflows/gmail-draft-windows.yml]
+  pull_request:
+    paths: [gmail-draft, .github/workflows/gmail-draft-windows.yml]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Credential Manager round trip
+        shell: python
+        run: |
+          from importlib.machinery import SourceFileLoader
+          gd = SourceFileLoader("gd", "gmail-draft").load_module()
+          assert gd.WINDOWS
+          assert gd.keychain_get("ci_probe", required=False) is None
+          gd.keychain_set("ci_probe", "1//0abc-DEF_ghi.jkl~mno+pq=")
+          assert gd.keychain_get("ci_probe") == "1//0abc-DEF_ghi.jkl~mno+pq="
+          gd.keychain_set("ci_probe", "overwritten")
+          assert gd.keychain_get("ci_probe") == "overwritten"
+          print("round trip ok")
+      - name: Dry run with non-ASCII body through a pipe
+        shell: pwsh
+        run: |
+          $OutputEncoding = [System.Text.UTF8Encoding]::new()
+          "Hi Anggie — café test" | python gmail-draft create --to a@example.com --subject "Test — é" --dry-run --no-signature
